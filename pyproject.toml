@@ -1,0 +1,76 @@
+[project]
+name = "speechcollector"
+version = "0.3.0"
+description = "Collect speech training data from video, podcasts, and local recordings — timestamped markdown or TTS/STT datasets"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "faster-whisper>=1.2.1",
+    "feedparser>=6.0.12",
+    "pydantic>=2.13.4",
+    "typer>=0.26.7",
+    "youtube-transcript-api>=1.2.4",
+    "yt-dlp>=2026.6.9",
+]
+
+[project.scripts]
+speechcollector = "speechcollector.cli:app"
+
+[project.optional-dependencies]
+mcp = [
+    "mcp>=1.2",
+]
+parakeet = [
+    "parakeet-mlx>=0.5; sys_platform == 'darwin' and platform_machine == 'arm64'",
+]
+diarize = [
+    "pyannote.audio>=4.0",
+]
+
+[build-system]
+requires = ["uv_build>=0.11.17,<0.12.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "mcp>=1.2",
+    "mypy>=2.1.0",
+    "parakeet-mlx>=0.5; sys_platform == 'darwin' and platform_machine == 'arm64'",
+    "pytest>=9.1.0",
+    "ruff>=0.15.17",
+]
+
+[tool.ruff]
+line-length = 100
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+allowed-confusables = ["–", "“", "”", "‘", "’"]
+select = [
+    "E",
+    "W",
+    "F",
+    "I",
+    "UP",
+    "B",
+    "C4",
+    "SIM",
+    "RUF",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"src/speechcollector/webui.py" = ["E501"]
+
+[tool.mypy]
+files = ["src", "tests"]
+python_version = "3.11"
+check_untyped_defs = true
+warn_unused_ignores = true
+
+[[tool.mypy.overrides]]
+module = ["faster_whisper.*", "feedparser.*", "parakeet_mlx.*", "pyannote.*"]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

@@ -1,0 +1,27 @@
+{
+  "name": "openai-compatible",
+  "endpoint": "https://api.openai.com/v1/audio/transcriptions",
+  "method": "POST",
+  "headers": {
+    "Authorization": "Bearer ${OPENAI_API_KEY}"
+  },
+  "upload": "multipart",
+  "audio_field": "file",
+  "form_fields": {
+    "model": "whisper-1",
+    "response_format": "verbose_json",
+    "timestamp_granularities": ["word", "segment"]
+  },
+  "text_path": "text",
+  "segments_path": "segments",
+  "segment_text_key": "text",
+  "segment_start_key": "start",
+  "segment_end_key": "end",
+  "words_path": "words",
+  "word_text_key": "word",
+  "word_start_key": "start",
+  "word_end_key": "end",
+  "language_path": "language",
+  "duration_path": "duration",
+  "max_upload_mb": 25
+}

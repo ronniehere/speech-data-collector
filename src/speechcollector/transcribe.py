@@ -1,0 +1,441 @@
+"""Speech-to-text with a pluggable backend.
+
+Three engines are supported and selected by model name:
+
+* **Parakeet** (``parakeet`` / ``parakeet-en``) — NVIDIA Parakeet TDT running on
+  Apple's MLX. On Apple Silicon it transcribes ~3x faster than ``whisper-small``
+  on CPU (~24x vs ~7x realtime on an M1 Pro), with comparable accuracy.
+  Multilingual (v3) or English-only (v2).
+* **Whisper** (``tiny``…``large-v3``) — faster-whisper / ctranslate2 on CPU,
+  int8. Portable everywhere; the fallback when Parakeet is unavailable.
+* **Remote API** (``api:<name>`` or ``api:/path/to/profile.json``) — any HTTP
+  STT endpoint described by a JSON profile (see ``speechcollector.remote``).
+
+``auto`` (the default) picks Parakeet when it is installed and runnable, else
+``whisper-small`` — so every platform gets the fastest engine it has.
+
+Local backends are imported lazily inside the functions here: the captions-only
+path, and the engine you are not using, never pay the (heavy, slow) import cost.
+"""
+
+import os
+from collections.abc import Callable
+from contextlib import contextmanager
+from pathlib import Path
+from typing import NamedTuple
+
+from speechcollector.errors import TranscriptionError
+from speechcollector.models import Segment, Word
+
+# Whisper sizes, smallest (fastest) to largest (most accurate).
+WHISPER_SIZES = ("tiny", "base", "small", "medium", "large-v3")
+# Back-compat alias (older imports referenced MODEL_SIZES).
+MODEL_SIZES = WHISPER_SIZES
+
+# Parakeet model aliases → MLX-community repo ids. ``parakeet`` is multilingual
+# (25 European languages); ``parakeet-en`` is English-only. Override the repo
+# for either alias with SPEECHCOLLECTOR_PARAKEET_MODEL.
+PARAKEET_MODELS = {
+    "parakeet": "mlx-community/parakeet-tdt-0.6b-v3",
+    "parakeet-en": "mlx-community/parakeet-tdt-0.6b-v2",
+}
+
+# Whisper size used when ``auto`` falls back off Parakeet.
+DEFAULT_WHISPER = "small"
+# Default model: resolve the fastest available engine at transcription time.
+DEFAULT_MODEL = "auto"
+
+# Long files are transcribed in overlapping windows so progress can be reported
+# and memory stays bounded; shorter files run in a single pass.
+_PARAKEET_CHUNK_S = 120.0
+
+# Reports (processed_seconds, total_seconds) as transcription advances.
+ProgressCallback = Callable[[float, float], None]
+
+
+class TranscriptionResult(NamedTuple):
+    """Engine output mapped onto speechcollector's segment model.
+
+    ``method`` is the document-facing label (e.g. ``whisper-small`` or
+    ``parakeet-tdt-0.6b-v3``); ``model_size`` is the requested model identifier.
+    ``words`` is the engine-agnostic word-level timing, populated only when
+    ``word_timestamps=True`` (dataset mode); ``None`` otherwise, so the markdown
+    path and its JSON schema are unaffected.
+    """
+
+    segments: list[Segment]
+    language: str
+    duration_s: float
+    model_size: str
+    method: str
+    words: list[Word] | None = None
+
+
+def transcribe_audio(
+    path: Path,
+    *,
+    model_size: str = DEFAULT_MODEL,
+    language: str | None = None,
+    local_files_only: bool = False,
+    vad_filter: bool = True,
+    word_timestamps: bool = False,
+    on_progress: ProgressCallback | None = None,
+) -> TranscriptionResult:
+    """Transcribe an audio/video file into timed segments.
+
+    Args:
+        path: Path to a local media file (any container ffmpeg can decode).
+        model_size: ``auto`` (default), a Parakeet alias (``parakeet`` /
+            ``parakeet-en``), a Whisper size (``tiny``…``large-v3``), or a
+            remote API spec (``api:<name>`` / ``api:/path/to/profile.json``).
+        language: Force a language code, or ``None`` to auto-detect (Whisper).
+            Parakeet auto-detects internally; this only labels the output.
+        local_files_only: If True, never reach the network — load the model
+            from the local cache or fail. Used by the offline test suite.
+            Remote API profiles ignore this (they always call the network).
+        vad_filter: Voice-activity detection (Whisper only). ``True`` (default)
+            skips silence/music beds — right for speech. Set ``False`` for
+            music/songs. Parakeet and remote APIs ignore this.
+        word_timestamps: When True, also return engine-agnostic word-level
+            timings on ``result.words`` (for dataset mode). Default False, so the
+            markdown/JSON path is unchanged and pays no extra cost. Remote APIs
+            require a ``words_path`` in the profile when this is True.
+        on_progress: Optional callback invoked with (processed_s, total_s).
+
+    Raises:
+        TranscriptionError: the model could not be loaded (e.g. not cached and
+            offline, or Parakeet requested but not installed), the remote API
+            failed, or the file could not be decoded.
+    """
+    engine, identifier = _resolve_engine(model_size)
+    if engine == "remote":
+        return _transcribe_remote(
+            path,
+            spec=identifier,
+            language=language,
+            word_timestamps=word_timestamps,
+            on_progress=on_progress,
+        )
+    if engine == "parakeet":
+        return _transcribe_parakeet(
+            path,
+            repo_id=identifier,
+            language=language,
+            local_files_only=local_files_only,
+            word_timestamps=word_timestamps,
+            on_progress=on_progress,
+        )
+    return _transcribe_whisper(
+        path,
+        model_size=identifier,
+        language=language,
+        local_files_only=local_files_only,
+        vad_filter=vad_filter,
+        word_timestamps=word_timestamps,
+        on_progress=on_progress,
+    )
+
+
+def _resolve_engine(model_size: str) -> tuple[str, str]:
+    """Map a model name to an ``(engine, identifier)`` pair.
+
+    ``auto`` resolves to Parakeet when it is importable, else Whisper. An
+    explicit Parakeet alias stays Parakeet (and fails loudly later if it cannot
+    load), so an explicit choice is never silently downgraded. ``api:...``
+    selects the remote HTTP engine; the identifier is the profile name or path.
+    """
+    if model_size.startswith("api:"):
+        return "remote", model_size[4:]  # bare name or path (prefix stripped)
+    if model_size == "auto":
+        if _parakeet_available():
+            return "parakeet", PARAKEET_MODELS["parakeet"]
+        return "whisper", DEFAULT_WHISPER
+    if model_size in PARAKEET_MODELS:
+        repo = os.environ.get("SPEECHCOLLECTOR_PARAKEET_MODEL") or PARAKEET_MODELS[model_size]
+        return "parakeet", repo
+    if model_size in WHISPER_SIZES:
+        return "whisper", model_size
+    raise TranscriptionError(
+        f"Unknown transcription model: {model_size!r}",
+        hint=(
+            f"Choose one of: auto, {', '.join(PARAKEET_MODELS)}, "
+            f"{', '.join(WHISPER_SIZES)}, or api:<name> / api:/path/to/profile.json"
+        ),
+    )
+
+
+def _transcribe_remote(
+    path: Path,
+    *,
+    spec: str,
+    language: str | None,
+    word_timestamps: bool,
+    on_progress: ProgressCallback | None,
+) -> TranscriptionResult:
+    """Transcribe via a remote HTTP STT API described by a JSON profile."""
+    from speechcollector.remote import load_api_profile, transcribe_remote
+
+    config = load_api_profile(spec)
+    return transcribe_remote(
+        path,
+        config=config,
+        language=language,
+        word_timestamps=word_timestamps,
+        on_progress=on_progress,
+    )
+
+
+def _parakeet_available() -> bool:
+    """True when parakeet-mlx can be imported (Apple Silicon + extra installed)."""
+    from importlib.util import find_spec
+
+    try:
+        return find_spec("parakeet_mlx") is not None
+    except (ImportError, ValueError):  # pragma: no cover - defensive
+        return False
+
+
+# --- Parakeet (MLX) backend ----------------------------------------------
+
+
+def _transcribe_parakeet(
+    path: Path,
+    *,
+    repo_id: str,
+    language: str | None,
+    local_files_only: bool,
+    word_timestamps: bool,
+    on_progress: ProgressCallback | None,
+) -> TranscriptionResult:
+    """Transcribe via NVIDIA Parakeet on MLX (Apple Silicon GPU/Neural Engine)."""
+    model = _load_parakeet(repo_id, local_files_only=local_files_only)
+    sample_rate = model.preprocessor_config.sample_rate
+    audio_total_s = 0.0  # true media length, learned from the chunk callback
+
+    def _chunk_cb(end_samples: float, total_samples: float) -> None:
+        nonlocal audio_total_s
+        if total_samples > 0:
+            audio_total_s = total_samples / sample_rate
+        if on_progress is not None and total_samples > 0:
+            on_progress(min(end_samples, total_samples) / sample_rate, total_samples / sample_rate)
+
+    try:
+        result = model.transcribe(
+            str(path),
+            chunk_duration=_PARAKEET_CHUNK_S,
+            chunk_callback=_chunk_cb,
+        )
+    except Exception as exc:
+        raise TranscriptionError(
+            f"Could not transcribe {path}: {exc}",
+            hint="Check the file is a valid audio/video file and ffmpeg is installed.",
+        ) from exc
+
+    segments: list[Segment] = []
+    for sent in result.sentences:
+        text = sent.text.strip()
+        if not text:
+            continue
+        start_s = max(0.0, float(sent.start))
+        end_s = max(float(sent.end), start_s)
+        segments.append(Segment(text=text, start_s=start_s, end_s=end_s))
+
+    # Prefer the true media length (from the chunk callback) so trailing silence
+    # or a speechless file still reports the real duration — matching the Whisper
+    # path. The callback doesn't fire for clips <= one chunk (120s), so fall back
+    # to the last spoken segment's end there.
+    last_seg_end = segments[-1].end_s if segments else 0.0
+    duration_s = max(audio_total_s, last_seg_end)
+    if on_progress is not None:
+        on_progress(duration_s, duration_s)
+    label = repo_id.split("/")[-1]
+    words: list[Word] | None = None
+    if word_timestamps:
+        from speechcollector.dataset.words import words_from_parakeet
+
+        words = words_from_parakeet(result.tokens)
+    return TranscriptionResult(
+        segments=segments,
+        language=language or "en",
+        duration_s=duration_s,
+        model_size=label,
+        method=label,
+        words=words,
+    )
+
+
+def _load_parakeet(repo_id: str, *, local_files_only: bool):
+    """Load a Parakeet MLX model, mapping failures to friendly errors."""
+    try:
+        from parakeet_mlx import from_pretrained
+    except ImportError as exc:
+        raise TranscriptionError(
+            "parakeet-mlx is not installed.",
+            hint=(
+                "Install the fast Apple-Silicon engine with "
+                'uv tool install "speechcollector[parakeet]" (macOS arm64), '
+                "or use --model small for CPU Whisper."
+            ),
+        ) from exc
+    # parakeet-mlx has no offline-only switch; force Hugging Face into offline
+    # mode so a cached model loads without any network round-trip. The env var
+    # alone is read at import time, so we also flip the live module constant.
+    _ensure_download_timeout()
+    with _hf_offline(local_files_only):
+        try:
+            return from_pretrained(repo_id)
+        except Exception as exc:
+            raise TranscriptionError(
+                f"Could not load the Parakeet model '{repo_id}': {exc}",
+                hint=(
+                    "The model downloads once (~2.5GB). Check your network on first "
+                    "use, then it is cached for offline runs."
+                ),
+            ) from exc
+
+
+@contextmanager
+def _hf_offline(enabled: bool):
+    """Temporarily force ``huggingface_hub`` offline when ``enabled``.
+
+    The ``HF_HUB_OFFLINE`` env var is read into a module constant at import
+    time, so setting it now is too late if hf_hub is already imported — we flip
+    the live constant as well, then restore both on exit.
+    """
+    if not enabled:
+        yield
+        return
+    prior_env = os.environ.get("HF_HUB_OFFLINE")
+    os.environ["HF_HUB_OFFLINE"] = "1"
+    try:
+        from huggingface_hub import constants
+
+        prior_const = constants.HF_HUB_OFFLINE
+        constants.HF_HUB_OFFLINE = True
+    except Exception:  # pragma: no cover - hf_hub always present with parakeet
+        constants = None  # type: ignore[assignment]
+    try:
+        yield
+    finally:
+        if prior_env is None:
+            os.environ.pop("HF_HUB_OFFLINE", None)
+        else:
+            os.environ["HF_HUB_OFFLINE"] = prior_env
+        if constants is not None:
+            constants.HF_HUB_OFFLINE = prior_const
+
+
+# Slow links need more than huggingface_hub's 10s default read-timeout for the
+# multi-GB Parakeet/Whisper weights, or a single chunk read raises "The read
+# operation timed out" mid-download. Raise the floor to 60s while honoring any
+# value the user already set (via env or the live constant).
+_DOWNLOAD_TIMEOUT_FLOOR = "60"
+
+
+def _ensure_download_timeout() -> None:
+    """Bump huggingface_hub's download read-timeout floor for large weights.
+
+    Sets the env var (covers fresh/forked subprocesses and the not-yet-imported
+    case) and, since the constant is frozen from the env at import time but read
+    live at download time, also bumps the live constant — but only when it is
+    still at the default, so an explicit user value is never lowered. Touches
+    nothing offline-related, so the ``local_files_only`` path stays network-free.
+    """
+    os.environ.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", _DOWNLOAD_TIMEOUT_FLOOR)
+    try:
+        from huggingface_hub import constants
+
+        default = getattr(constants, "DEFAULT_DOWNLOAD_TIMEOUT", 10)
+        if default >= constants.HF_HUB_DOWNLOAD_TIMEOUT:
+            constants.HF_HUB_DOWNLOAD_TIMEOUT = int(_DOWNLOAD_TIMEOUT_FLOOR)
+    except Exception:  # pragma: no cover - defensive; hf_hub ships with both backends
+        return
+
+
+# --- Whisper (faster-whisper) backend ------------------------------------
+
+
+def _transcribe_whisper(
+    path: Path,
+    *,
+    model_size: str,
+    language: str | None,
+    local_files_only: bool,
+    vad_filter: bool,
+    word_timestamps: bool,
+    on_progress: ProgressCallback | None,
+) -> TranscriptionResult:
+    """Transcribe via faster-whisper on CPU (int8)."""
+    model = _load_whisper(model_size, local_files_only=local_files_only)
+    # whisper's segment iterator is lazy — the actual decode happens as we
+    # consume it, so live progress is reported here. Only this loop can fail on
+    # a bad file; Segment construction is done afterward so a model invariant
+    # slip (e.g. end < start) surfaces honestly, not as a bogus "bad file".
+    raw: list[tuple[str, float, float]] = []
+    raw_words: list = []  # faster-whisper Word objects, only when word_timestamps
+    try:
+        segment_iter, info = model.transcribe(
+            str(path), language=language, vad_filter=vad_filter, word_timestamps=word_timestamps
+        )
+        for seg in segment_iter:
+            raw.append((seg.text, seg.start, seg.end))
+            if word_timestamps and seg.words:
+                raw_words.extend(seg.words)
+            if on_progress is not None:
+                on_progress(min(seg.end, info.duration), info.duration)
+    except Exception as exc:
+        raise TranscriptionError(
+            f"Could not transcribe {path}: {exc}",
+            hint="Check the file is a valid audio/video file and ffmpeg is installed.",
+        ) from exc
+
+    segments: list[Segment] = []
+    for text, start, end in raw:
+        text = text.strip()
+        if not text:
+            continue
+        start_s = max(0.0, start)
+        end_s = max(end, start_s)  # whisper occasionally yields end < start
+        segments.append(Segment(text=text, start_s=start_s, end_s=end_s))
+    if on_progress is not None:
+        on_progress(info.duration, info.duration)
+    words: list[Word] | None = None
+    if word_timestamps:
+        from speechcollector.dataset.words import words_from_whisper
+
+        words = words_from_whisper(raw_words)
+    return TranscriptionResult(
+        segments=segments,
+        language=info.language or "en",
+        duration_s=float(info.duration),
+        model_size=model_size,
+        method=f"whisper-{model_size}",
+        words=words,
+    )
+
+
+def _load_whisper(model_size: str, *, local_files_only: bool):
+    """Load a faster-whisper model on CPU, mapping failures to friendly errors."""
+    try:
+        from faster_whisper import WhisperModel
+    except ImportError as exc:  # pragma: no cover - dependency is declared
+        raise TranscriptionError(
+            "faster-whisper is not installed.",
+            hint="Reinstall speechcollector so transcription support is available.",
+        ) from exc
+    _ensure_download_timeout()
+    try:
+        return WhisperModel(
+            model_size,
+            device="cpu",
+            compute_type="int8",
+            local_files_only=local_files_only,
+        )
+    except Exception as exc:
+        raise TranscriptionError(
+            f"Could not load the '{model_size}' whisper model: {exc}",
+            hint=(
+                "The model downloads once (~tens of MB to ~1.5GB). Check your "
+                "network on first use, then it is cached for offline runs."
+            ),
+        ) from exc
